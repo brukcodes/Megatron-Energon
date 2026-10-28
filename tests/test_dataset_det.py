@@ -29,7 +29,7 @@ from megatron.energon.dataset_config import get_dataset_from_config
 from megatron.energon.flavors.common.manifest.paths import MAIN_FOLDER_NAME
 from megatron.energon.loader import get_savable_loader
 from megatron.energon.task_encoder.base import stateless
-from megatron.energon.tools.checkpoint import command_redist
+from megatron.energon.tools.checkpoint import command_info, command_redist
 
 # Speed up tests significantly by reducing the torch status check interval for broken worker shutdown
 try:
@@ -1076,6 +1076,201 @@ class TestDataset(unittest.TestCase):
         # Delete all locals, otherwise loaders might be kept alive
         locals().clear()
         gc.collect()
+
+    def _loader(self, rank_config: WorkerConfig, micro_batch_size: int):
+        return get_savable_loader(
+            get_train_dataset(
+                self.dataset_path,
+                split_part="train",
+                sample_type=TextSample,
+                worker_config=rank_config,
+                batch_size=micro_batch_size,
+                shuffle_buffer_size=42,
+                max_samples_per_sequence=2,
+            )
+        )
+
+    def _global_batches(
+        self,
+        configs: tuple[WorkerConfig, ...],
+        *,
+        micro_batch_size: int,
+        global_batch_size: int,
+        state_for_rank,
+        num_global_batches: int,
+    ):
+        """Collect sorted global batches, restoring one rank state per config."""
+        world_size = len(configs)
+        gradient_accum_steps = global_batch_size // (micro_batch_size * world_size)
+        num_micro = num_global_batches * gradient_accum_steps
+        batches_per_rank = []
+        loaders = []
+        try:
+            for rank_config in configs:
+                loader = self._loader(rank_config, micro_batch_size)
+                loaders.append(loader)
+                state = state_for_rank(rank_config)
+                if state is not None:
+                    loader.restore_state_rank(state)
+                batches_per_rank.append([data.text for _, data in zip(range(num_micro), loader)])
+        finally:
+            for loader in loaders:
+                loader.close()
+
+        global_batches = []
+        batch_index = 0
+        while batch_index < len(batches_per_rank[0]):
+            global_batch = []
+            for _ in range(gradient_accum_steps):
+                for rank_batches in batches_per_rank:
+                    global_batch.extend(rank_batches[batch_index])
+                batch_index += 1
+                if batch_index >= len(batches_per_rank[0]):
+                    break
+            global_batches.append(sorted(global_batch))
+        return global_batches
+
+    def _invoke_redist(self, inputs: list[Path], output: Path, world_size: int):
+        output.mkdir(parents=True, exist_ok=True)
+        return CliRunner().invoke(
+            command_redist,
+            [
+                "--new-world-size",
+                str(world_size),
+                *[str(path) for path in inputs],
+                str(output),
+            ],
+        )
+
+    def test_redist_single_rank_checkpoint(self):
+        """One saved rank, including a global checkpoint, can be resumed on more ranks.
+
+        The total reader-worker count stays fixed. Four workers on one rank become
+        two ranks of two workers, or four ranks of one worker, and the merged
+        global batches stay the same.
+        """
+        micro_batch_size = 2
+        global_batch_size = 8
+        num_global_batches = 4
+        source = WorkerConfig(rank=0, world_size=1, num_workers=4)
+
+        loader = self._loader(source, micro_batch_size)
+        try:
+            for _ in zip(range(20), loader):
+                pass
+            state = loader.save_state_rank()
+            reference = []
+            gradient_accum_steps = global_batch_size // micro_batch_size
+            num_micro = num_global_batches * gradient_accum_steps
+            micro_batches = [data.text for _, data in zip(range(num_micro), loader)]
+            batch_index = 0
+            while batch_index < len(micro_batches):
+                global_batch = []
+                for _ in range(gradient_accum_steps):
+                    global_batch.extend(micro_batches[batch_index])
+                    batch_index += 1
+                    if batch_index >= len(micro_batches):
+                        break
+                reference.append(sorted(global_batch))
+        finally:
+            loader.close()
+
+        rank_checkpoint = self.checkpoint_dir / "state_rank0.pt"
+        torch.save(state, rank_checkpoint)
+
+        scenarios = (
+            (
+                WorkerConfig(rank=0, world_size=2, num_workers=2),
+                WorkerConfig(rank=1, world_size=2, num_workers=2),
+            ),
+            (
+                WorkerConfig(rank=0, world_size=4, num_workers=1),
+                WorkerConfig(rank=1, world_size=4, num_workers=1),
+                WorkerConfig(rank=2, world_size=4, num_workers=1),
+                WorkerConfig(rank=3, world_size=4, num_workers=1),
+            ),
+        )
+        for configs in scenarios:
+            output = self.redist_dir / f"world{len(configs)}"
+            result = self._invoke_redist([rank_checkpoint], output, len(configs))
+            self.assertEqual(result.exit_code, 0, result.output)
+            resumed = self._global_batches(
+                configs,
+                micro_batch_size=micro_batch_size,
+                global_batch_size=global_batch_size,
+                state_for_rank=lambda rank_config, output=output: torch.load(
+                    output / f"state_rank{rank_config.rank}.pt", weights_only=False
+                ),
+                num_global_batches=num_global_batches,
+            )
+            self.assertEqual(resumed, reference)
+
+        step_checkpoint = self.checkpoint_dir / "step1000_rank0.pt"
+        torch.save(state, step_checkpoint)
+        step_output = self.redist_dir / "step"
+        result = self._invoke_redist([step_checkpoint], step_output, 2)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue((step_output / "step1000_rank0.pt").is_file())
+        self.assertTrue((step_output / "step1000_rank1.pt").is_file())
+        self.assertFalse((step_output / "step1001_rank0.pt").exists())
+        moved_rank = torch.load(step_output / "step1000_rank1.pt", weights_only=False)
+        self.assertEqual(len(moved_rank.worker_states), 2)
+
+        plain_checkpoint = self.checkpoint_dir / "dataloader.pt"
+        torch.save(state, plain_checkpoint)
+        plain_output = self.redist_dir / "plain"
+        result = self._invoke_redist([plain_checkpoint], plain_output, 2)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue((plain_output / "dataloader_rank0.pt").is_file())
+        self.assertTrue((plain_output / "dataloader_rank1.pt").is_file())
+
+        ambiguous_checkpoint = self.checkpoint_dir / "a1_b2.pt"
+        torch.save(state, ambiguous_checkpoint)
+        result = self._invoke_redist([ambiguous_checkpoint], self.redist_dir / "ambiguous", 2)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("rank", str(result.exception))
+
+        megatron_checkpoint = self.checkpoint_dir / "loader_rank0.pt"
+        torch.save({"dataloader_state_dict": state}, megatron_checkpoint)
+        megatron_output = self.redist_dir / "megatron"
+        result = self._invoke_redist([megatron_checkpoint], megatron_output, 2)
+        self.assertEqual(result.exit_code, 0, result.output)
+        wrapped = torch.load(megatron_output / "loader_rank1.pt", weights_only=False)
+        self.assertEqual(len(wrapped["dataloader_state_dict"].worker_states), 2)
+
+        global_checkpoint = self.checkpoint_dir / "dataloader_global.pt"
+        torch.save([state], global_checkpoint)
+        info = CliRunner().invoke(command_info, [str(global_checkpoint)])
+        self.assertEqual(info.exit_code, 0, info.output)
+        self.assertIn("Checkpoint type: Global checkpoint", info.output)
+        self.assertIn("Number of DP ranks: 1", info.output)
+        self.assertIn("Number of workers per DP rank: 4", info.output)
+
+        global_output = self.redist_dir / "global"
+        result = self._invoke_redist([global_checkpoint], global_output, 2)
+        self.assertEqual(result.exit_code, 0, result.output)
+        redistributed = torch.load(global_output / "dataloader_global.pt", weights_only=False)
+        self.assertEqual(len(redistributed), 2)
+        resumed = self._global_batches(
+            scenarios[0],
+            micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
+            state_for_rank=lambda rank_config, redistributed=redistributed: redistributed[
+                rank_config.rank
+            ],
+            num_global_batches=num_global_batches,
+        )
+        self.assertEqual(resumed, reference)
+
+        rank_info = CliRunner().invoke(command_info, [str(rank_checkpoint)])
+        self.assertEqual(rank_info.exit_code, 0, rank_info.output)
+        self.assertIn("Checkpoint type: Per-rank checkpoint files", rank_info.output)
+        self.assertIn("Number of DP ranks: 1", rank_info.output)
+        self.assertIn("state_rank0.pt", rank_info.output)
+
+        rejected = self._invoke_redist([rank_checkpoint], self.redist_dir / "rejected", 3)
+        self.assertNotEqual(rejected.exit_code, 0)
+        self.assertIn("divisible", rejected.output)
 
 
 if __name__ == "__main__":

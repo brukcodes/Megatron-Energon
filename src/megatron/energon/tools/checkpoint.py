@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import re
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import click
 import torch
@@ -21,11 +21,67 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)]
 
 
+def _tokenize_filename(fname: str) -> list[str]:
+    """Split a filename into alternating text and numeric tokens."""
+    return re.split(r"(\d+)", fname)
+
+
+def _pattern_from_numeric_token(tokens: list[str], varying_pos: int) -> Callable[[int], str]:
+    """Return a filename generator that advances one numeric token from its current value."""
+    base_value = int(tokens[varying_pos])
+    width = len(tokens[varying_pos])
+
+    def generate_filename(n: int) -> str:
+        new_tokens = tokens[:]
+        new_tokens[varying_pos] = str(base_value + n).zfill(width)
+        return "".join(new_tokens)
+
+    return generate_filename
+
+
+def _pattern_for_single_filename(tokens: list[str]) -> Callable[[int], str]:
+    """Choose which number in a single checkpoint name is the rank index.
+
+    A number immediately after the word ``rank`` wins, so ``step1000_rank0.pt``
+    advances the rank and leaves the step counter alone. Otherwise the only
+    number in the name is the rank. A name with no number grows a ``_rank{n}``
+    suffix. Several unmarked numbers are rejected instead of guessing.
+    """
+    numeric_positions = [pos for pos, token in enumerate(tokens) if token.isdigit()]
+    rank_positions = [
+        pos for pos in numeric_positions if pos > 0 and tokens[pos - 1].lower().endswith("rank")
+    ]
+    if rank_positions:
+        return _pattern_from_numeric_token(tokens, rank_positions[-1])
+    if len(numeric_positions) == 1:
+        return _pattern_from_numeric_token(tokens, numeric_positions[0])
+    if not numeric_positions:
+        filename = "".join(tokens)
+        stem, dot, ext = filename.rpartition(".")
+
+        def generate_filename(n: int) -> str:
+            if dot and stem:
+                return f"{stem}_rank{n}.{ext}"
+            return f"{filename}_rank{n}"
+
+        return generate_filename
+
+    raise Exception(
+        "A single checkpoint filename contains multiple numbers and none is a rank index. "
+        "Name it so the rank follows the word 'rank', for example 'loader_rank0.pt'."
+    )
+
+
 def detect_and_replicate_pattern(file_list):
     """
     Given a list of file paths, detect the single numeric pattern and return
     a function that, when called with integer n (starting from 0), generates
     the n-th filename following that pattern.
+
+    A single filename is accepted. Its rank index is the number after ``rank``
+    when present, otherwise its only number. ``n=0`` reproduces that file, and
+    larger ``n`` advance the rank. A filename with no number gets a
+    ``_rank{n}`` suffix.
 
     Raises an Exception if no pattern or multiple patterns are found.
     """
@@ -36,15 +92,10 @@ def detect_and_replicate_pattern(file_list):
     sorted_files = sorted(file_list, key=natural_sort_key)
 
     # -- 2) Tokenize each filename into [text, number, text, number, ...].
-    #        We'll look for the pattern of tokens across all files.
-    def tokenize_filename(fname):
-        # Use the same split so that digit tokens are separated
-        # from non-digit tokens.
-        tokens = re.split(r"(\d+)", fname)
-        # tokens is like ["f", "001", ".txt"] for "f001.txt"
-        return tokens
+    tokenized = [_tokenize_filename(f) for f in sorted_files]
 
-    tokenized = [tokenize_filename(f) for f in sorted_files]
+    if len(sorted_files) == 1:
+        return _pattern_for_single_filename(tokenized[0])
 
     # Check that all tokenized filenames have the same number of chunks:
     token_len = len(tokenized[0])
@@ -139,16 +190,25 @@ def detect_and_replicate_pattern(file_list):
 
 
 class RankStateIterable:
-    """Iterates the SavableDatasetCheckpoints of mulitple ranks in a round-robin fashion."""
+    """Iterates the SavableDatasetCheckpoints of multiple ranks in a round-robin fashion."""
 
     def __init__(self, state_files: List[EPath]):
-        state_file_names = [state_file.name for state_file in state_files]
+        if not state_files:
+            raise ValueError("Cannot read a checkpoint from an empty file list.")
 
-        self.file_pattern_func = detect_and_replicate_pattern(state_file_names)
-        self.num_states = len(state_files)
+        # Natural order matches rank indexes encoded in names such as `state_rank0.pt`.
+        self.state_files = sorted(state_files, key=lambda path: natural_sort_key(path.name))
+        state_file_names = [state_file.name for state_file in self.state_files]
+
+        # Several rank files must share one varying rank number before we trust them.
+        # A single file is loaded first: it may be a global checkpoint, which keeps its name.
+        self.file_pattern_func = (
+            detect_and_replicate_pattern(state_file_names) if len(self.state_files) > 1 else None
+        )
+        self.num_states = len(self.state_files)
 
         # First open the first one to figure out if this is a global checkpoint or not
-        first_state = torch.load(str(state_files[0]), weights_only=False)
+        first_state = torch.load(str(self.state_files[0]), weights_only=False)
 
         if isinstance(first_state, dict) and "dataloader_state_dict" in first_state:
             self.megatron_style = True
@@ -157,19 +217,21 @@ class RankStateIterable:
             self.megatron_style = False
 
         if isinstance(first_state, SavableDataLoaderState):
+            if self.file_pattern_func is None:
+                self.file_pattern_func = detect_and_replicate_pattern(state_file_names)
             if self.megatron_style:
                 self.rank_states = [first_state] + [
                     torch.load(str(state_file), weights_only=False)["dataloader_state_dict"]
-                    for state_file in state_files[1:]
+                    for state_file in self.state_files[1:]
                 ]
             else:
                 self.rank_states = [first_state] + [
                     torch.load(str(state_file), weights_only=False)
-                    for state_file in state_files[1:]
+                    for state_file in self.state_files[1:]
                 ]
             self.is_global_checkpoint = False
         elif isinstance(first_state, list):
-            assert len(state_files) == 1, "Global checkpoint must contain exactly one file"
+            assert len(self.state_files) == 1, "Global checkpoint must contain exactly one file"
             assert all(isinstance(state, SavableDataLoaderState) for state in first_state)
             self.rank_states = first_state
             self.is_global_checkpoint = True
@@ -230,10 +292,17 @@ class RankStateIterable:
 def command_redist(
     input_files: List[EPath], output_path: EPath, new_world_size: Optional[int] = None
 ):
-    """Redistribute a checkpoint.
+    """Redistribute a checkpoint to a different data-parallel world size.
 
-    Read checkpoint files from INPUT_FILES and redistribute them for a new
-    number of ranks. Write the output to OUTPUT_PATH."""
+    Read one global checkpoint, one rank checkpoint, or one file per rank from
+    INPUT_FILES. The total number of reader workers must stay the same and be
+    divisible by the new world size, so one rank with four workers can become
+    two ranks with two workers, or four ranks with one worker.
+
+    A per-rank filename should keep the rank index after the word "rank"
+    (``loader_rank0.pt``). That number is what this command advances. Write the
+    output to OUTPUT_PATH.
+    """
 
     # Verify input files
     if not input_files:
@@ -259,9 +328,13 @@ def command_redist(
         raise click.ClickException("New world size must be greater than 0")
 
     total_num_workers = rsi.get_num_workers() * rsi.get_num_ranks()
-    assert total_num_workers % new_world_size == 0, (
-        "New DP world size must be a multiple of the current DP world size"
-    )
+    if total_num_workers % new_world_size != 0:
+        raise click.ClickException(
+            "The total number of reader workers "
+            f"({total_num_workers} = {rsi.get_num_ranks()} ranks x {rsi.get_num_workers()} workers) "
+            f"must be divisible by the new data-parallel world size ({new_world_size}). "
+            "Keep the same total worker count and choose a world size that divides it."
+        )
     new_workers_per_rank = total_num_workers // new_world_size
 
     # Ensure output directory exists
@@ -331,7 +404,7 @@ def command_info(input_files: List[EPath]):
         if rsi.is_global_checkpoint:
             click.echo(f"  Rank {rank_idx}:")
         else:
-            click.echo(f"  Rank {rank_idx} ({input_files[rank_idx].name}):")
+            click.echo(f"  Rank {rank_idx} ({rsi.state_files[rank_idx].name}):")
         click.echo(f"    Next worker ID: {state.next_worker_id}")
         click.echo(f"    Number of worker states: {len(state.worker_states)}")
 

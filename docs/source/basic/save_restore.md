@@ -140,6 +140,26 @@ state = torch.load('dataloader_state.pth')
 loader.restore_state_global(state, src_rank=None)
 ```
 
+## Resuming with a different number of ranks
+
+Reader workers are partitioned across data-parallel ranks. A checkpoint can be resumed on a different world size when the total number of reader workers stays the same and is divisible by the new world size. One rank with four workers can resume as two ranks with two workers, or as four ranks with one worker.
+
+Save each rank as its own file and keep the rank index after the word `rank`:
+
+```shell
+energon checkpoint redist --new-world-size 2 dataloader_state_rank0.pth redistributed/
+```
+
+One input file is enough. The command writes `dataloader_state_rank0.pth` and `dataloader_state_rank1.pth`. Pass every current rank file the same way when the checkpoint was saved on more than one rank. The number that follows `rank` is the one that changes, so a name such as `step1000_rank0.pt` keeps `1000`.
+
+A global checkpoint, the list returned by `save_state_global`, is a single file and is rewritten as one global file for the new world size:
+
+```shell
+energon checkpoint redist --new-world-size 2 dataloader_state.pth redistributed/
+```
+
+`energon checkpoint info` prints the rank count and the worker count for either layout.
+
 ## Error Handling During Restore
 
 By default, energon uses a strict error handler during checkpoint restoration to ensure data integrity.
